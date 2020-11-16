@@ -1,0 +1,318 @@
+
+One needs to run install.package('') for each of these.
+```{r}
+library(gdata)
+library(spef)
+library(data.table)
+library(dplyr)
+library(purrr)
+library(lubridate)
+library(caret)
+library(BCA1SG)
+```
+This function corrupts data that is marked missing by replacing it with a Poisson(1) random variable.
+```{r}
+data(bladTumor)
+data(blaTum)
+df_blaTum <- blaTum
+df_blaTum$prev_time<-integer(nrow(df_blaTum))
+for(i in 1:nrow(df_blaTum)){
+  if(i==1){
+    df_blaTum$prev_time[i]<-0
+  }
+  else{
+    if(df_blaTum$id[i]==df_blaTum$id[i-1]){
+      df_blaTum$prev_time[i]<-df_blaTum$time[i-1]
+    }
+    else{
+      df_blaTum$prev_time[i]<-0
+    }
+  }
+}
+
+#prev_time<-df_blaTum$time[1:(length(df_blaTum$time)-1)]
+# prev_time<-prepend(prev_time,0)
+#df#_blaTum$prev_time<-prev_time
+```
+
+```{r}
+corrupt_data <- function(df,missing_indices,count_column){
+  
+  #@df: dataframe
+  #@missing_indices: which indices are missing, a vector
+  #@count_column: which column of df has counts, we will corrupt these
+  
+  df_corrupt<-cbind(df)
+  for(i in 1:length(missing_indices)){
+    if(missing_indices[i]==1){
+      df_corrupt[i,count_column]=rpois(1,1)
+    }
+  }
+  return(df_corrupt)
+}
+```
+
+This function takes a dataframe and bootstrap resamples by the same id.  Because some of the methods are step functions we add a small amount of noise (1e-6 in either direction) in order to have unique time points for the mean function to jump.
+```{r}
+bootstrap_dataset<-function(df){
+  
+  #df: dataframe for data
+  
+  ids<-unique(df$id)
+  resampled_df<-data.frame(matrix(ncol = ncol(df), nrow = 0))
+  resample_ids<-resample(ids, length(ids), replace = TRUE, prob = NULL)
+  counter<-0
+  
+  for(participant in resample_ids){
+    participant_data<-subset(df,id==participant)
+    participant_data$id<-rep(counter,nrow(participant_data))
+    K<-nrow(participant_data)
+    participant_data$time<-participant_data$time+runif(nrow(participant_data),-1e-6,1e-6)
+    if(counter==0){
+      resampled_df<-participant_data
+    }
+    else{
+      resampled_df<-rbind(resampled_df,participant_data)
+    }
+    counter<-counter+1
+  }
+  return(resampled_df)
+}
+```
+
+```{r}
+fit_model<-function(df,formula,method){
+  fit1 <- panelReg(formula, data=df, method = method, se = "NULL")
+  return(fit1)
+}
+```
+
+This is the E-step for the EM algorithm
+```{r}
+impute_missing <- function(df,missing_indices,fit,id_index,time_index,count_index){
+  #filled_in<-fit$baseline(df$time)-fit$baseline(df$prev_time)
+  #filled_in<-filled_in[which(missing_indices==1)]
+  #df[which(missing_indices==1),]$count<-filled_in[which(missing_indices==1)]
+  
+  for(i in 1:length(missing_indices)){
+    #if missing
+    if(missing_indices[i]==1){
+      if(i>1 && df[i,id_index]==df[i-1,id_index]){
+        df[i,count_index]=fit$baseline(df[i,time_index])-fit$baseline(df[i-1,time_index])
+      }
+      else{
+        df[i,count_index]=fit$baseline(df[i,time_index])
+      }
+    }
+  }
+  return(df)
+}
+```
+
+This is the EM wrapper
+```{r}
+run_EM<-function(df_corrupt,formula,missing_indices,n_iter,method,id_index,time_index,count_index){
+  fitTumorCorrupt<-fit_model(df_corrupt,formula,method)
+  fitEM<-fitTumorCorrupt
+  df_update<-cbind(df_corrupt)
+  for(i in range(1:n_iter)){
+    #use current mean function to impute (E-step)
+    df_update <- impute_missing(df_update,missing_indices,fitEM,id_index,time_index,count_index)
+    #update current mean function (M-step)
+    fitEM<-fit_model(df_update,formula,method)
+  }
+  return(fitEM)
+}
+```
+
+In order to change with method you generate a plot for, change the method here
+```{r}
+count_column<-6
+id_index<-1
+time_index<-5
+count_index<-6
+#CHANGE THIS
+method<-'AEE'
+#missing indices
+formula <- PanelSurv(id, time, count) ~ 1
+original_model<-fit_model(df_blaTum,formula,method)
+```
+
+```{r}
+df_resampled<-bootstrap_dataset(df_blaTum)
+missing_indices = runif(nrow(df_resampled),0,1)
+missing_indices = (missing_indices<missing_rate)
+df_corrupt<-corrupt_data(df_resampled,missing_indices,count_column)
+run_EM(df_corrupt,formula,missing_indices,n_iter,method,id_index,time_index,count_index)
+```
+Replace nruns with how many runs you want for bootstrapping.  Note that smooth estimators (MPLs,MLs) take about 10x longer to run (about 5 hours for this block with single CPU) than step functions (MPL,AEE,AEEX, about 20-30 mins).
+```{r}
+missing_rates<- c(0.1,0.2)#,0.3,0.4)
+start_time <- Sys.time()
+nruns<-5
+n_iter<-100
+models_corrupt<-vector(mode = "list", length = nruns)
+models_complete<-vector(mode = "list", length = nruns)
+models<-vector(mode = "list", length = nruns)
+models_zero<-vector(mode = "list", length = nruns)
+time_grid_all<-c()
+for(i in 1:nruns){
+  df_resampled<-bootstrap_dataset(df_blaTum)
+  for(missing_rate in missing_rates){
+    #corrupt data and generate missing indices
+    missing_indices = runif(nrow(df_resampled),0,1)
+    missing_indices = (missing_indices<missing_rate)
+    #df_resampled$count[which(missing_indices==1)]
+    df_corrupt<-corrupt_data(df_resampled,missing_indices,count_column)
+    df_zero<-cbind(df_resampled)
+    df_zero$count[which(missing_indices==1)]<-0
+    models_zero[[paste(missing_rate,i)]]<-panelReg(formula, data = df_zero, method = method)
+    models[[paste(missing_rate,i)]]<-run_EM(df_corrupt,formula,missing_indices,n_iter,method,id_index,time_index,count_index)
+  }
+  
+  models_corrupt[[i]]<-panelReg(formula, data = df_corrupt, method = method)
+  models_complete[[i]]<-panelReg(formula, data = df_resampled, method = method)
+  time_grid_all<-c(time_grid_all,models[[paste(missing_rate,i)]]$timeGrid)
+}
+end_time <- Sys.time()
+print(end_time-start_time)
+```
+
+Based on how many bootstrap iterates you made, I advise changing the length of the next line, new time grid
+```{r}
+new_time_grid<-resample(time_grid_all,length(time_grid_all)/300,replace=FALSE)
+#If we are using a smoothed estimator, we need to make sure x-axis doesn't go too far
+if(method=='MPLs' || method=='MLs'){
+  new_time_grid<-new_time_grid[new_time_grid<48]
+}
+#Em statistics, each column is mean, .025, .975
+#each row is a missing rate
+em_statistics<-data.frame(matrix(0,ncol=3*length(missing_rates),nrow=length(new_time_grid)))
+
+zero_statistics<-data.frame(matrix(0,ncol=3*length(missing_rates),nrow=length(new_time_grid)))
+
+em_statistics_cols<-c()
+zero_statistics_cols<-c()
+for(i in 1:length(missing_rates)){
+  em_statistics_cols<-c(em_statistics_cols,paste('mean',i),paste('lower',i),paste('upper',i))
+  zero_statistics_cols<-c(zero_statistics_cols,paste('mean',i),paste('lower',i),paste('upper',i))
+}
+colnames(em_statistics)<-em_statistics_cols
+colnames(zero_statistics)<-zero_statistics_cols
+
+corrupt_statistics<-data.frame(matrix(0,ncol=3,nrow=length(new_time_grid)))
+colnames(corrupt_statistics)<-c('mean','lower','upper')
+complete_statistics<-data.frame(matrix(0,ncol=3,nrow=length(new_time_grid)))
+colnames(complete_statistics)<-c('mean','lower','upper')
+
+new_time_grid<-sort(new_time_grid)
+mean_of_means_em<-c()
+c_upper_em<-c()
+c_lower_em<-c()
+c_upper_zero<-c()
+z_lower_zero<-c()
+mean_of_means_zero<-c()
+for(t in 1:length(new_time_grid)){
+  t_all_em<-data.frame(matrix(0,ncol=length(missing_rates),nrow=length(models_complete)))
+  colnames(t_all_em)<-missing_rates
+  t_all_zero<-data.frame(matrix(0,ncol=length(missing_rates),nrow=length(models_complete)))
+  colnames(t_all_zero)<-missing_rates
+  t_all_complete<-c()
+  t_all_corrupt<-c()
+  for(j in 1:length(models_complete)){
+    #iterate over missing rates
+    for(i in 1:length(missing_rates)){
+      model<-models[[paste(missing_rates[i],j)]]
+      t_all_em[j,i]<-model$baseline(new_time_grid[t])
+      model_zero<-models_zero[[paste(missing_rates[i],j)]]
+      t_all_zero[j,i]<-model_zero$baseline(new_time_grid[t])
+    }
+    model<-models_complete[[j]]
+    t_all_complete<- c(t_all_complete,model$baseline(new_time_grid[t]))
+    model<-models_corrupt[[j]]
+    t_all_corrupt<- c(t_all_corrupt,model$baseline(new_time_grid[t]))
+  }
+  for(i in 1:length(missing_rates)){
+    em_statistics[t,1+3*(i-1)]<-mean(t_all_em[,i])
+    em_statistics[t,2+3*(i-1)]<-quantile(t_all_em[,i],c(.025))
+    em_statistics[t,3+3*(i-1)]<-quantile(t_all_em[,i],c(.975))
+    zero_statistics[t,1+3*(i-1)]<-mean(t_all_zero[,i])
+    zero_statistics[t,2+3*(i-1)]<-quantile(t_all_zero[,i],c(.025))
+    zero_statistics[t,3+3*(i-1)]<-quantile(t_all_zero[,i],c(.975))
+  }
+  complete_statistics$mean[t]<-mean(t_all_complete)
+  complete_statistics$lower[t]<-quantile(t_all_complete, c(.025)) 
+  complete_statistics$upper[t]<-quantile(t_all_complete, c(.975))
+  corrupt_statistics$mean[t]<-mean(t_all_corrupt)
+  corrupt_statistics$lower[t]<-quantile(t_all_corrupt, c(.025)) 
+  corrupt_statistics$upper[t]<-quantile(t_all_corrupt, c(.975))
+}
+
+```
+
+Next we make figure 2 in the main paper.  Note that this will save the figure to file.
+```{r}
+jpeg("bladder-tumor.jpeg",width=750,height=375)
+par(mar=c(5,8,4,1)+.1)
+legend_names<-c('Complete','EM','Initial','Zero fill')
+legend_colors<-c('black','blue','red','palegreen4')
+light_colors<-adjustcolor(legend_colors,alpha.f=0.1)
+legend_lwd<-c(2,2,1.5,1.5)
+legend_lty<-c(1,2,3,4)
+means<-vector(mode = "list", length = 4)
+means[[1]]<-complete_statistics$mean
+means[[2]]<-em_statistics$`mean 2`
+means[[3]]<-corrupt_statistics$mean
+means[[4]]<-zero_statistics$`mean 2`
+lower<-vector(mode = "list", length = 4)
+lower[[1]]<-complete_statistics$lower
+lower[[2]]<-em_statistics$`lower 2`
+lower[[3]]<-corrupt_statistics$lower
+lower[[4]]<-zero_statistics$`lower 2`
+upper<-vector(mode = "list", length = 4)
+upper[[1]]<-complete_statistics$upper
+upper[[2]]<-em_statistics$`upper 2`
+upper[[3]]<-corrupt_statistics$upper
+upper[[4]]<-zero_statistics$`upper 2`
+
+
+for(i in 1:length(means)){
+  if(i==1){
+    plot(new_time_grid,means[[i]],type='l',col=legend_colors[i],lty=legend_lty[i],lwd=legend_lwd[i],main="Bladder Tumor Experiment",xlab="Time",ylab='Expected Tumors',cex.main=2,cex.lab=2,ylim=c(0,12))
+  }
+  else{
+    lines(new_time_grid,means[[i]],type='l',col=legend_colors[i],lwd=legend_lwd[i],lty=legend_lty[i])
+  }
+  polygon(c(new_time_grid, rev(new_time_grid)), c(lower[[i]], rev(upper[[i]])),col=light_colors[i],border=NA)
+}
+
+legend(3,10.5,legend=legend_names,lty=legend_lty,col=legend_colors,lwd=legend_lwd)
+dev.off()
+```
+
+We now make the varied missingness plot, which also saves to file.
+```{r}
+tiff(paste("bladder-tumor-varied-missing-",paste(method,".tif",sep=""),sep=""),width=750,height=375)
+par(mar=c(5,8,4,1)+.1)
+legend_names<-c()
+legend_colors<-c('black','blue','red','purple4','orange')
+light_colors<-adjustcolor(legend_colors,alpha.f=0.05)
+legend_lwd<-c(1,2,2,2,1)
+legend_lty<-c(1,2,3,4,5)
+n<-length(missing_rates)
+
+plot(new_time_grid,complete_statistics$mean,type='l',col=legend_colors[1],lty=legend_lty[1],lwd=legend_lwd[1],main=paste("Bladder Tumors: Varied Missingness Probability",method),xlab="Time",ylab='Expected Tumors',cex.main=2,cex.lab=2)
+legend_names<-c(legend_names,'Complete')
+
+
+for(i in 1:n){
+    lines(new_time_grid,em_statistics[,1+3*(i-1)],type='l',col=legend_colors[i+1],lty=legend_lty[i+1],lwd=legend_lwd[i+1])
+    polygon(c(new_time_grid, rev(new_time_grid)), c(em_statistics[,3+3*(i-1)], rev(em_statistics[,2+3*(i-1)])),col=light_colors[i+1],border=NA)
+  legend_names<-c(legend_names,paste('EM',missing_rates[i]))
+}
+legend(40,3,legend=legend_names,lty=legend_lty,col=legend_colors,lwd=legend_lwd)
+dev.off()
+
+```
+
+As a unit test, try running resample with replace=False.  It should look the same as original data.
