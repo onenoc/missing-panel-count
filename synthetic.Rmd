@@ -1,0 +1,229 @@
+```{r}
+library(spef)
+library(data.table)
+library(dplyr)
+library(purrr)
+library(lubridate)
+library(caret)
+library(BCA1SG)
+```
+
+Here we define true mean function.  Change it as you wish.
+```{r}
+true_mean_function <- function(t){
+  return(t^2)
+}
+```
+
+
+Next we generate observation times
+```{r}
+generate_observation_times <- function(rate,num_times){
+  intervals <- rexp(num_times,rate)
+  observation_times <- c(cumsum(intervals))
+}
+```
+
+
+#generates counts from a Poisson process
+```{r}
+generate_counts<- function(observation_times){
+  counts <- c()
+  for(i in 1:length(observation_times)){
+    if(i==1){
+      counts <- c(counts,rpois(1,true_mean_function(observation_times[1])))
+    }else{
+      counts <- c(counts,rpois(1,true_mean_function(observation_times[i])-true_mean_function(observation_times[i-1])))
+    }
+  }
+  return(counts)
+}
+```
+
+This creates a participant matrix.  Participants, the end times, and the counts of each interval
+```{r}
+generate_participant_matrix <- function(num_participants,num_intervals,obs_rate){
+  df <- data.frame(matrix(0,num_participants*num_intervals,3))
+  colnames(df)<-c('Participant','End','Counts')
+  for(i in 1:num_participants){
+    obs_times <- generate_observation_times(obs_rate,num_intervals)
+    counts <- generate_counts(obs_times)
+    df[(1+num_intervals*(i-1)):(num_intervals*(i)),1]<-i
+    df[(1+num_intervals*(i-1)):(num_intervals*(i)),2]<-obs_times
+    df[(1+num_intervals*(i-1)):(num_intervals*(i)),3]<-counts
+  }
+  return(df)
+}
+```
+
+```{r}
+corrupt_data <- function(df,missing_indices){
+  for(i in 1:length(missing_indices)){
+    if(missing_indices[i]==1){
+      df[i,3]=rpois(1,5)
+    }
+  }
+  return(df)
+}
+```
+
+
+```{r}
+fit_model<-function(df,method){
+  formula<-PanelSurv(Participant,End,Counts)~1
+  fit1 <- panelReg(formula, data=df, method =method, se = "NULL")
+  return(fit1)
+}
+```
+
+```{r}
+impute_missing <- function(df,missing_indices,fit){
+  for(i in 1:length(missing_indices)){
+    #if missing
+    if(missing_indices[i]==1){
+      #is this the first observation for this person
+      if(i==1 || df[i,1]!=df[i-1,1]){
+        df[i,3]=fit$baseline(df[i,2])
+      }
+      else{
+        df[i,3]=fit$baseline(df[i,2])-fit$baseline(df[i-1,2])
+      }
+    }
+  }
+  return(df)
+}
+```
+
+
+
+```{r}
+run_EM<-function(df_corrupt,missing_indices,n_iter){
+  formula <- PanelSurv(Participant,End,Counts) ~ 1
+  
+  fitCorrupt<-panelReg(formula, data = df_corrupt, method = "AEE")
+  fitEM<-fitCorrupt
+  df_update<-cbind(df_corrupt)
+  for(i in range(1:n_iter)){
+    #use current mean function to impute
+    df_update <- impute_missing(df_update,missing_indices,fitEM)
+    fitEM<-panelReg(formula, data=df_update, method = 'AEE', se = "NULL")
+  }
+  return(fitEM)
+}
+```
+
+```{r}
+num_participants<-100
+num_intervals<-30
+obs_rate<-1
+missing_rate<-0.2
+df<-generate_participant_matrix(num_participants,num_intervals,obs_rate)
+n_iter<-100
+method<-'AEE'
+formula<-PanelSurv(Participant,End,Counts)~1
+#fit to true data
+fit1 <- fit_model(df,method)
+plot(fit1)
+missing_indices = runif(nrow(df),0,1)
+missing_indices = (missing_indices<missing_rate)
+df_corrupt<-corrupt_data(df,missing_indices)
+fit2<-fit_model(df_corrupt,method)
+plot(fit2)
+
+fit3<-run_EM(df_corrupt,missing_indices,n_iter)
+plot(fit3)
+```
+
+```{r}
+start_time <- Sys.time()
+nruns<-1000
+n_iter<-100
+models_corrupt<-vector(mode = "list", length = nruns)
+models_complete<-vector(mode = "list", length = nruns)
+models<-vector(mode = "list", length = nruns)
+time_grid_all<-c()
+for(i in 1:nruns){
+  sample<-generate_participant_matrix(num_participants,num_intervals,obs_rate)
+  #corrupt data and generate missing indices
+  missing_indices = runif(nrow(sample),0,1)
+  missing_indices = (missing_indices<missing_rate)
+  df_corrupt<-corrupt_data(sample,missing_indices)
+  
+  models[[i]]<-run_EM(df_corrupt,missing_indices,n_iter)
+  models_corrupt[[i]]<-panelReg(formula, data = df_corrupt, method = "AEE")
+  models_complete[[i]]<-panelReg(formula, data = sample, method = "AEE")
+  time_grid_all<-c(time_grid_all,models[[i]]$timeGrid)
+}
+end_time <- Sys.time()
+print(end_time-start_time)
+```
+```{r}
+new_time_grid<-resample(time_grid_all,length(time_grid_all)/3000,replace=FALSE)
+new_time_grid<-sort(new_time_grid)
+mean_of_means_em<-c()
+mean_of_means_complete<-c()
+mean_of_means_corrupt<-c()
+c_upper_em<-c()
+c_lower_em<-c()
+c_upper_complete<-c()
+c_lower_complete<-c()
+c_upper_corrupt<-c()
+c_lower_corrupt<-c()
+for(t in new_time_grid){
+  t_all_em<-c()
+  t_all_complete<-c()
+  t_all_corrupt<-c()
+  for(model in models){
+    t_all_em<- c(t_all_em,model$baseline(t))
+  }
+  for(model in models_complete){
+    t_all_complete<- c(t_all_complete,model$baseline(t))
+  }
+  for(model in models_corrupt){
+    t_all_corrupt<- c(t_all_corrupt,model$baseline(t))
+  }
+  t_mean_em<-mean(t_all_em)
+  mean_of_means_em<-c(mean_of_means_em,t_mean_em)
+  t_mean_complete<-mean(t_all_complete)
+  mean_of_means_complete<-c(mean_of_means_complete,t_mean_complete)
+  t_mean_corrupt<-mean(t_all_corrupt)
+  mean_of_means_corrupt<-c(mean_of_means_corrupt,t_mean_corrupt)
+  c_lower_em<-c(c_lower_em,quantile(t_all_em, c(.025)) )
+  c_upper_em<-c(c_upper_em,quantile(t_all_em, c(.975)) )
+  c_lower_complete<-c(c_lower_complete,quantile(t_all_complete, c(.025)) )
+  c_upper_complete<-c(c_upper_complete,quantile(t_all_complete, c(.975)) )
+  c_lower_corrupt<-c(c_lower_corrupt,quantile(t_all_corrupt, c(.025)) )
+  c_upper_corrupt<-c(c_upper_corrupt,quantile(t_all_corrupt, c(.975)) )
+}
+
+```
+
+
+This saves results to file.  Change the first line based on the filename you want.
+```{r}
+tiff("quadratic.tif",width=750,height=375)
+par(mar=c(5,8,4,1)+.1)
+plot(new_time_grid,mean_of_means_em,type='s',col='blue',main="Quadratic Experiment",xlab="Time",ylab='Expected Cumulative Counts',lty=2,cex.main=2,cex.lab=2)
+
+
+polygon(c(new_time_grid, rev(new_time_grid)), c(c_upper_em, rev(c_lower_em)),
+     col = rgb(0, 0, 255, max = 255, alpha = 25, names = "blue50"), border = NA)
+#polygon(c(fit2$timeGrid, rev(fit2$timeGrid)), c(fit2$baseline(fit2$timeGrid)+2*fit2$baselineSE, rev(fit2$baseline(fit2$timeGrid)-2*fit2$baselineSE)),
+#     col = rgb(255, 0, 0, max = 255, alpha = 25, names = "blue50"), border = NA)
+
+#lines(new_time_grid,c_lower_em,col='blue',lty=3)
+#lines(new_time_grid,c_upper_em,col='blue',lty=3)
+
+#lines(new_time_grid,mean_of_means_complete,type='s',col='orange')
+lines(new_time_grid,true_mean_function(new_time_grid),type='l',col='black')
+#lines(new_time_grid,c_lower_complete,col='black',lty=3)
+#lines(new_time_grid,c_upper_complete,col='black',lty=3)
+
+#polygon(c(new_time_grid, rev(new_time_grid)), c(c_upper_complete, rev(c_lower_complete)),
+#     col = rgb(0, 0, 0, max = 255, alpha = 25, names = "red50"), border = NA)
+
+lines(new_time_grid,mean_of_means_corrupt,type='s',col='red',lty=3,lwd=2)
+legend(35,700, legend=c("True","EM", "Initial"),
+       col=c("black","blue","red"),lty=c(1,2,3),lwd=c(1,1,2), cex=1.5)
+dev.off()
+```
